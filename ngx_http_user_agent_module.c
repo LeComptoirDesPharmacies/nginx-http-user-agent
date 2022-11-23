@@ -7,7 +7,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include "ngx_trie.h"
 
 
 #define NGX_HTTP_UA_MATCH_LE            '-'
@@ -26,16 +25,21 @@ typedef struct {
     uint64_t                            left;
     uint64_t                            right;
 
+    ngx_array_t                        *rcs;
     ngx_http_variable_value_t          *var;
 } ngx_http_user_agent_interval_t;
 
 
 typedef struct {
-    ngx_trie_t                         *trie;
+    ngx_array_t                        *intervals;
     ngx_http_variable_value_t          *default_value;
     ngx_pool_t                         *pool;
 } ngx_http_user_agent_ctx_t;
 
+typedef struct {
+    ngx_str_t                   name;
+    ngx_str_t                   regexp;
+} ngx_user_agent_rule_t;
 
 static char *ngx_http_user_agent_block(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -91,6 +95,13 @@ ngx_module_t ngx_http_user_agent_module = {
 };
 
 
+static ngx_user_agent_rule_t ngx_user_agent_rules[] = {
+        {
+                ngx_string("opera"),
+                ngx_string("OPR/([0-9.]+)(:?s|$)")
+        }
+};
+
 static char *
 ngx_http_user_agent_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -117,10 +128,7 @@ ngx_http_user_agent_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     ctx->pool = cf->pool;
-    ctx->trie = ngx_trie_create(ctx->pool);
-    if (ctx->trie == NULL) {
-        return NGX_CONF_ERROR;
-    }
+
 
     ctx->default_value = NULL;
 
@@ -133,9 +141,6 @@ ngx_http_user_agent_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cf->handler_conf = conf;
 
     rv = ngx_conf_parse(cf, NULL);
-    if (NGX_OK != ctx->trie->build_clue(ctx->trie)) {
-        return NGX_CONF_ERROR;
-    }
 
     *cf = save;
     if (ctx->default_value == NULL) {
@@ -251,21 +256,24 @@ error:
 static char *
 ngx_http_user_agent(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_str_t                      *args, *name, file;
-    ngx_uint_t                      i, nelts, mode;
-    ngx_trie_t                     *trie;
-    ngx_array_t                    *value;
-    ngx_trie_node_t                *node;
+    ngx_str_t                      *args;
+    ngx_uint_t                      nelts;
+    //ngx_array_t                    *value;
     ngx_http_user_agent_ctx_t      *ctx;
-    ngx_http_user_agent_interval_t *interval, *p;
+    ngx_http_user_agent_interval_t *interval;
+#if (NGX_PCRE)
+    ngx_str_t             rc_name;
+    ngx_regex_compile_t   rc;
+    u_char                errstr[NGX_MAX_CONF_ERRSTR];
+    ngx_regex_elt_t  *re;
+#endif
 
     ctx = cf->ctx;
-    trie = ctx->trie;
 
     args = cf->args->elts;
     nelts = cf->args->nelts;
 
-    name = NULL;
+    //name = NULL;
 
     if (nelts <= 1) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -275,18 +283,6 @@ ngx_http_user_agent(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     if (nelts == 2) {
-        if (ngx_strcmp(args[0].data, "include") == 0) {
-
-            file = args[1];
-            if (ngx_conf_full_name(cf->cycle, &file, 1) != NGX_OK) {
-                return NGX_CONF_ERROR;
-            }
-
-            ngx_log_debug1(NGX_LOG_DEBUG_CORE, cf->log, 0, "include %s",
-                           file.data);
-            return ngx_conf_parse(cf, &file);
-        }
-
         if (ngx_strcmp(args[0].data, "default") == 0) {
 
             if (ctx->default_value != NULL) {
@@ -309,18 +305,11 @@ ngx_http_user_agent(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             return NGX_CONF_OK;
         }
-
-        if (ngx_strcmp(args[0].data, "greedy") == 0) {
-            mode = NGX_TRIE_REVERSE | NGX_TRIE_CONTINUE;
-            trie->insert(trie, args + 1, mode);
-
-            return NGX_CONF_OK;
-        }
     }
 
     if (nelts == 2) {
 
-        name = args;
+        //name = args;
 
         interval = ngx_pcalloc(ctx->pool,
                                sizeof(ngx_http_user_agent_interval_t));
@@ -349,7 +338,7 @@ ngx_http_user_agent(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     if (nelts == 3) {
 
-        name = args;
+        //name = args;
         interval = ngx_http_user_agent_get_version(cf, args + 1);
         if (interval == NULL) {
             return NGX_CONF_ERROR;
@@ -369,14 +358,32 @@ ngx_http_user_agent(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_ERROR;
 
 insert:
+#if (NGX_PCRE)
+    ngx_memzero(&rc, sizeof(ngx_regex_compile_t));
+    rc_name = ngx_user_agent_rules[0].regexp;
+    rc.pattern = rc_name;
+    rc.pool = cf->pool;
+    rc.err.len = NGX_MAX_CONF_ERRSTR;
+    rc.err.data = errstr;
+    /* rc.options can be set to NGX_REGEX_CASELESS */
 
-    mode = NGX_TRIE_REVERSE;
-    node = trie->insert(trie, name, mode);
-    if (node == NULL) {
+    if (ngx_regex_compile(&rc) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "%V", &rc.err);
         return NGX_CONF_ERROR;
     }
 
-    value = (ngx_array_t *) node->value;
+    interval->rcs = ngx_array_create(ctx->pool, 1,
+                                        sizeof(ngx_regex_compile_t));
+
+    re = ngx_array_push(interval->rcs);
+    if (re == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    re->regex = rc.regex;
+    re->name = rc_name.data;
+#endif
+    /*value = (ngx_array_t *) node->value;
     if (value == NULL) {
         value = ngx_array_create(ctx->pool, 2,
                                  sizeof(ngx_http_user_agent_interval_t));
@@ -403,7 +410,7 @@ insert:
     }
 
     *p = *interval;
-    node->value = (void *) value;
+    node->value = (void *) value;*/
 
     return NGX_CONF_OK;
 }
@@ -413,16 +420,23 @@ static ngx_int_t
 ngx_http_user_agent_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
-    uint64_t                        ver, scale, version;
-    ngx_int_t                       i, n, pos, offset;
-    ngx_str_t                      *user_agent;
-    ngx_trie_t                     *trie;
-    ngx_array_t                    *value;
-    ngx_http_user_agent_ctx_t      *uacf;
-    ngx_http_user_agent_interval_t *array;
+    uint64_t                         ver, scale, version;
+    ngx_int_t                        i, n, j, m, pos, start, end;
+    ngx_str_t                        *user_agent;
+    ngx_array_t                      *intervals;
+    //ngx_array_t                      *value;
+    ngx_array_t                      *rcs;
+    ngx_http_user_agent_ctx_t        *uacf;
+    ngx_http_user_agent_interval_t   *array;
+    ngx_regex_elt_t                  *rc_array;
+    ngx_regex_elt_t                  rc;
+    //ngx_int_t                        captures_size;
+    ngx_int_t                        regexp_result;
+    //ngx_str_t                        regexp_group;
+
+    int captures[6];
 
     uacf = (ngx_http_user_agent_ctx_t *) data;
-    trie = uacf->trie;
 
     if (r->headers_in.user_agent == NULL) {
         goto end;
@@ -430,18 +444,45 @@ ngx_http_user_agent_variable(ngx_http_request_t *r,
 
     user_agent = &(r->headers_in.user_agent->value);
 
-    value = trie->query(trie, user_agent, &pos, NGX_TRIE_REVERSE);
-    if (value == NULL || pos < 0) {
-        goto end;
+
+    intervals = uacf->intervals;
+    array = intervals->elts;
+    n = intervals->nelts;
+
+    for (i = 0; i < n; i++) {
+        rcs = array[i].rcs;
+        rc_array = rcs->elts;
+        m = rcs->nelts;
+        for (j = 0; j < m; j++) {
+            rc = rc_array[j];
+
+            regexp_result = ngx_regex_exec(rc.regex, user_agent, captures, 6);
+
+            if (regexp_result >= 0) {
+                goto find_version;
+            }
+        }
     }
+
+    goto end;
+
+find_version:
+
+    start = captures[0];
+    end = captures[1];
+
+
+    /*if (value == NULL || pos < 0) {
+        goto end;
+    }*/
 
     version = 0;
     scale = NGX_HTTP_UA_MAX_INT64;
     ver = 0;
-    offset = 0;
+    //offset = 0;
 
-    for (/* void */; pos < (ngx_int_t) user_agent->len; pos++, offset++) {
-        if (user_agent->data[pos] >= '0'
+    //for (/* void */; pos < (ngx_int_t) user_agent->len; pos++, offset++) {
+     /*   if (user_agent->data[pos] >= '0'
             && user_agent->data[pos] <= '9') {
             break;
 
@@ -455,12 +496,12 @@ ngx_http_user_agent_variable(ngx_http_request_t *r,
         if(offset >= NGX_HTTP_UA_MAX_OFFSET) {
             break;
         }
-    }
+    }*/
 
-    array = value->elts;
-    n = value->nelts;
+    //array = value->elts;
+    //n = value->nelts;
 
-    for (/* void */ ; pos < (ngx_int_t) user_agent->len; pos++) {
+    for (pos = start ; pos < end; pos++) {
 
         if (user_agent->data[pos] == '.') {
             version += ver * scale;
@@ -479,12 +520,12 @@ ngx_http_user_agent_variable(ngx_http_request_t *r,
     }
 
     version += ver * scale;
-    for (i = 0; i < n; i++) {
-        if (version > array[i].left && version < array[i].right) {
-            *v = *(array[i].var);
-            return NGX_OK;
-        }
+    //for (i = 0; i < n; i++) {
+    if (version > array[i].left && version < array[i].right) {
+        *v = *(array[i].var);
+        return NGX_OK;
     }
+    //}
 
 end:
 
