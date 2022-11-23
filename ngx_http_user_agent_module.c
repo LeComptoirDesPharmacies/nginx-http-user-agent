@@ -480,7 +480,7 @@ ngx_http_user_agent_variable(ngx_http_request_t *r,
 
     version += ver * scale;
     for (i = 0; i < n; i++) {
-        if (version >= array[i].left && version <= array[i].right) {
+        if (version > array[i].left && version < array[i].right) {
             *v = *(array[i].var);
             return NGX_OK;
         }
